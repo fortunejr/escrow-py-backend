@@ -132,6 +132,18 @@ def list_active_listings_view(request):
 
 
 @api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def list_my_listings_view(request):
+    """Authenticated endpoint for the current seller's listings."""
+    listings = Listing.objects.filter(seller=request.user).select_related("seller")
+    data = ListingSerializer(listings, many=True, context={"request": request}).data
+    return Response(
+        build_response(True, "My listings fetched successfully.", data=data, errors=None),
+        status=status.HTTP_200_OK,
+    )
+
+
+@api_view(["GET"])
 @permission_classes([AllowAny])
 def listing_detail_view(request, listing_id):
     """Retrieve one listing, hiding inactive listings from non-owners."""
