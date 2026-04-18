@@ -1,6 +1,10 @@
+import shutil
+import tempfile
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test import override_settings
 from django.urls import reverse
 from rest_framework import status
 from rest_framework.test import APITestCase
@@ -16,6 +20,10 @@ User = get_user_model()
 
 class ListingAPITests(APITestCase):
     def setUp(self):
+        self.media_root = tempfile.mkdtemp()
+        self.settings_override = override_settings(MEDIA_ROOT=self.media_root)
+        self.settings_override.enable()
+
         self.seller = User.objects.create_user(
             email="seller@example.com",
             password="StrongPass123!",
@@ -28,6 +36,10 @@ class ListingAPITests(APITestCase):
             first_name="Other",
             last_name="User",
         )
+
+    def tearDown(self):
+        self.settings_override.disable()
+        shutil.rmtree(self.media_root, ignore_errors=True)
 
     def authenticate(self, user):
         refresh = RefreshToken.for_user(user)
@@ -53,6 +65,24 @@ class ListingAPITests(APITestCase):
             1,
         )
 
+    def test_create_listing_with_image_upload(self):
+        self.authenticate(self.seller)
+        image = SimpleUploadedFile("listing.jpg", b"fake-image-content", content_type="image/jpeg")
+        payload = {
+            "title": "Camera",
+            "description": "Mirrorless camera",
+            "listing_type": "product",
+            "price": "600.00",
+            "image": image,
+        }
+
+        response = self.client.post(reverse("create-listing"), payload, format="multipart")
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(response.data["success"])
+        self.assertIn("/media/listings/", response.data["data"]["image"])
+        self.assertTrue(Listing.objects.first().image.name.startswith("listings/"))
+
     def test_create_listing_requires_authentication(self):
         payload = {
             "title": "Website Development",
@@ -66,6 +96,7 @@ class ListingAPITests(APITestCase):
         self.assertFalse(response.data["success"])
 
     def test_public_list_and_detail(self):
+        image = SimpleUploadedFile("active.jpg", b"active-image", content_type="image/jpeg")
         active_listing = Listing.objects.create(
             seller=self.seller,
             title="Active Listing",
@@ -73,6 +104,7 @@ class ListingAPITests(APITestCase):
             listing_type="product",
             price=Decimal("100.00"),
             is_active=True,
+            image=image,
         )
         Listing.objects.create(
             seller=self.seller,
@@ -90,6 +122,7 @@ class ListingAPITests(APITestCase):
         self.assertTrue(list_response.data["success"])
         self.assertEqual(len(list_response.data["data"]), 1)
         self.assertEqual(list_response.data["data"][0]["id"], active_listing.id)
+        self.assertIn("/media/listings/", list_response.data["data"][0]["image"])
 
         self.assertEqual(detail_response.status_code, status.HTTP_200_OK)
         self.assertTrue(detail_response.data["success"])
@@ -113,6 +146,29 @@ class ListingAPITests(APITestCase):
         listing.refresh_from_db()
         self.assertEqual(listing.title, "New Title")
         self.assertEqual(listing.price, Decimal("120.00"))
+
+    def test_owner_can_update_listing_image(self):
+        listing = Listing.objects.create(
+            seller=self.seller,
+            title="Image Listing",
+            description="Needs image",
+            listing_type="product",
+            price=Decimal("100.00"),
+        )
+        self.authenticate(self.seller)
+        image = SimpleUploadedFile("updated.jpg", b"updated-image-content", content_type="image/jpeg")
+
+        response = self.client.patch(
+            reverse("update-listing", kwargs={"listing_id": listing.id}),
+            {"image": image},
+            format="multipart",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["success"])
+        self.assertIn("/media/listings/", response.data["data"]["image"])
+        listing.refresh_from_db()
+        self.assertTrue(listing.image.name.startswith("listings/"))
 
     def test_non_owner_cannot_update_listing(self):
         listing = Listing.objects.create(

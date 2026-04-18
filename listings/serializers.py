@@ -17,6 +17,7 @@ class ListingSerializer(serializers.ModelSerializer):
             "listing_type",
             "listing_type_display",
             "price",
+            "image",
             "is_active",
             "created_at",
             "updated_at",

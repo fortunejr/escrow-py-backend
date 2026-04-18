@@ -52,6 +52,10 @@ Validation/auth failures:
 - Money values are handled as Decimal on backend.
 - In responses, amounts/prices are typically returned as strings (example: `"1200.00"`).
 
+## File uploads
+- Endpoints that upload files (for example listing image) must use `multipart/form-data`.
+- Listing image is returned as a URL string in response data (or `null` if no image).
+
 ---
 
 ## 2) Auth Endpoints
@@ -185,6 +189,7 @@ Success (`200`):
       "listing_type": "product",
       "listing_type_display": "Product",
       "price": "2500.00",
+      "image": "http://127.0.0.1:8000/media/listings/macbook.jpg",
       "is_active": true,
       "created_at": "2026-04-14T12:00:00.000000Z",
       "updated_at": "2026-04-14T12:00:00.000000Z"
@@ -199,17 +204,44 @@ Create a listing as authenticated seller.
 
 Auth: Required
 
-Request:
+Request (`multipart/form-data`):
 ```json
 {
   "title": "Logo Design",
   "description": "3 concepts + revisions",
   "listing_type": "service",
-  "price": "150.00"
+  "price": "150.00",
+  "image": "<binary file, optional>"
 }
 ```
 
-Success (`201`): returns created listing object.
+Success (`201`): returns created listing object including `image`.
+
+Example:
+```json
+{
+  "success": true,
+  "message": "Listing created successfully.",
+  "data": {
+    "id": 11,
+    "seller": {
+      "id": 2,
+      "email": "seller@example.com",
+      "name": "Seller One"
+    },
+    "title": "Logo Design",
+    "description": "3 concepts + revisions",
+    "listing_type": "service",
+    "listing_type_display": "Service",
+    "price": "150.00",
+    "image": "http://127.0.0.1:8000/media/listings/logo-design.jpg",
+    "is_active": true,
+    "created_at": "2026-04-14T12:05:00.000000Z",
+    "updated_at": "2026-04-14T12:05:00.000000Z"
+  },
+  "errors": null
+}
+```
 
 ## GET `/listings/{listing_id}/`
 Get listing details.
@@ -219,22 +251,24 @@ Auth: Not required
 Notes:
 - Active listing is public.
 - Inactive listing returns `404` for non-owner.
+- Response includes `image` URL (or `null` if no image).
 
 ## PATCH `/listings/{listing_id}/update/`
 Update own listing.
 
 Auth: Required (owner only)
 
-Request (partial):
+Request (partial, use `multipart/form-data` when uploading image):
 ```json
 {
   "title": "Logo Design Pro",
   "price": "180.00",
-  "is_active": true
+  "is_active": true,
+  "image": "<binary file, optional>"
 }
 ```
 
-Success (`200`): updated listing object.
+Success (`200`): updated listing object including current `image` URL.
 
 ## POST `/listings/{listing_id}/deactivate/`
 Deactivate own listing.

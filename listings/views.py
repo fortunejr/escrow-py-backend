@@ -39,6 +39,19 @@ def parse_price(value):
     return price
 
 
+def validate_image_upload(image_file):
+    if image_file is None:
+        return None
+
+    if not hasattr(image_file, "content_type"):
+        return "Image must be uploaded as a file."
+
+    if not str(image_file.content_type).startswith("image/"):
+        return "Uploaded file must be an image."
+
+    return None
+
+
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def create_listing_view(request):
@@ -47,6 +60,7 @@ def create_listing_view(request):
     description = request.data.get("description")
     listing_type = request.data.get("listing_type")
     price_input = request.data.get("price")
+    image_file = request.data.get("image")
 
     errors = {}
 
@@ -63,6 +77,10 @@ def create_listing_view(request):
     if price is None:
         errors["price"] = ["Price must be a valid number greater than 0."]
 
+    image_error = validate_image_upload(image_file)
+    if image_error:
+        errors["image"] = [image_error]
+
     if errors:
         return Response(
             build_response(False, "Listing creation failed.", data=None, errors=errors),
@@ -75,6 +93,7 @@ def create_listing_view(request):
         description=description.strip(),
         listing_type=listing_type,
         price=price,
+        image=image_file,
     )
     log_audit_event(
         actor=request.user,
@@ -90,7 +109,12 @@ def create_listing_view(request):
     )
 
     return Response(
-        build_response(True, "Listing created successfully.", data=ListingSerializer(listing).data, errors=None),
+        build_response(
+            True,
+            "Listing created successfully.",
+            data=ListingSerializer(listing, context={"request": request}).data,
+            errors=None,
+        ),
         status=status.HTTP_201_CREATED,
     )
 
@@ -100,7 +124,7 @@ def create_listing_view(request):
 def list_active_listings_view(request):
     """Public endpoint for active listings only."""
     listings = Listing.objects.filter(is_active=True).select_related("seller")
-    data = ListingSerializer(listings, many=True).data
+    data = ListingSerializer(listings, many=True, context={"request": request}).data
     return Response(
         build_response(True, "Active listings fetched successfully.", data=data, errors=None),
         status=status.HTTP_200_OK,
@@ -128,7 +152,12 @@ def listing_detail_view(request, listing_id):
             )
 
     return Response(
-        build_response(True, "Listing detail fetched successfully.", data=ListingSerializer(listing).data, errors=None),
+        build_response(
+            True,
+            "Listing detail fetched successfully.",
+            data=ListingSerializer(listing, context={"request": request}).data,
+            errors=None,
+        ),
         status=status.HTTP_200_OK,
     )
 
@@ -156,6 +185,7 @@ def update_listing_view(request, listing_id):
     listing_type = request.data.get("listing_type", None)
     price_input = request.data.get("price", None)
     is_active = request.data.get("is_active", None)
+    image_file = request.data.get("image", None)
 
     errors = {}
     has_update = False
@@ -196,6 +226,14 @@ def update_listing_view(request, listing_id):
             listing.is_active = is_active
             has_update = True
 
+    if image_file is not None:
+        image_error = validate_image_upload(image_file)
+        if image_error:
+            errors["image"] = [image_error]
+        else:
+            listing.image = image_file
+            has_update = True
+
     if errors:
         return Response(
             build_response(False, "Listing update failed.", data=None, errors=errors),
@@ -216,7 +254,12 @@ def update_listing_view(request, listing_id):
     listing.save()
     listing.refresh_from_db()
     return Response(
-        build_response(True, "Listing updated successfully.", data=ListingSerializer(listing).data, errors=None),
+        build_response(
+            True,
+            "Listing updated successfully.",
+            data=ListingSerializer(listing, context={"request": request}).data,
+            errors=None,
+        ),
         status=status.HTTP_200_OK,
     )
 
@@ -241,7 +284,12 @@ def deactivate_listing_view(request, listing_id):
 
     if not listing.is_active:
         return Response(
-            build_response(True, "Listing is already inactive.", data=ListingSerializer(listing).data, errors=None),
+            build_response(
+                True,
+                "Listing is already inactive.",
+                data=ListingSerializer(listing, context={"request": request}).data,
+                errors=None,
+            ),
             status=status.HTTP_200_OK,
         )
 
@@ -249,6 +297,11 @@ def deactivate_listing_view(request, listing_id):
     listing.save(update_fields=["is_active", "updated_at"])
     listing.refresh_from_db()
     return Response(
-        build_response(True, "Listing deactivated successfully.", data=ListingSerializer(listing).data, errors=None),
+        build_response(
+            True,
+            "Listing deactivated successfully.",
+            data=ListingSerializer(listing, context={"request": request}).data,
+            errors=None,
+        ),
         status=status.HTTP_200_OK,
     )
