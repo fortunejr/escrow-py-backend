@@ -7,9 +7,10 @@ from django.conf import settings
 
 
 class PaystackInitializationError(Exception):
-    def __init__(self, message, payload=None):
+    def __init__(self, message, payload=None, status_code=None):
         super().__init__(message)
         self.payload = payload or {}
+        self.status_code = status_code
 
 
 class PaystackVerificationError(Exception):
@@ -24,7 +25,40 @@ class PaystackPayoutError(Exception):
         self.payload = payload or {}
 
 
-def initialize_paystack_transaction(email, amount_kobo, reference, currency="NGN", metadata=None):
+def get_paystack_base_url():
+    raw_base = str(getattr(settings, "PAYSTACK_BASE_URL", "") or "").strip()
+    if not raw_base:
+        raw_base = "https://api.paystack.co"
+
+    raw_base = raw_base.rstrip("/")
+    normalized = raw_base.lower()
+
+    # Handle common misconfiguration where full endpoint is used as base URL.
+    for suffix in [
+        "/transaction/initialize",
+        "/transaction/verify",
+        "/transferrecipient",
+        "/transfer",
+        "/refund",
+    ]:
+        if normalized.endswith(suffix):
+            raw_base = raw_base[: -len(suffix)]
+            break
+
+    return raw_base.rstrip("/")
+
+
+def build_paystack_headers(secret_key):
+    return {
+        "Authorization": f"Bearer {secret_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        # Avoid generic Python urllib signatures that may be blocked upstream.
+        "User-Agent": "EscrowPaymentBackend/1.0",
+    }
+
+
+def initialize_paystack_transaction(email, amount_kobo, reference, currency="NGN", metadata=None, callback_url=None):
     secret_key = settings.PAYSTACK_SECRET_KEY
     if not secret_key:
         raise PaystackInitializationError("Paystack secret key is not configured.")
@@ -37,13 +71,12 @@ def initialize_paystack_transaction(email, amount_kobo, reference, currency="NGN
     }
     if metadata:
         payload["metadata"] = metadata
+    if callback_url:
+        payload["callback_url"] = callback_url
 
-    url = f"{settings.PAYSTACK_BASE_URL.rstrip('/')}/transaction/initialize"
+    url = f"{get_paystack_base_url()}/transaction/initialize"
     data = json.dumps(payload).encode("utf-8")
-    headers = {
-        "Authorization": f"Bearer {secret_key}",
-        "Content-Type": "application/json",
-    }
+    headers = build_paystack_headers(secret_key)
     req = request.Request(url=url, data=data, headers=headers, method="POST")
 
     try:
@@ -54,11 +87,20 @@ def initialize_paystack_transaction(email, amount_kobo, reference, currency="NGN
         try:
             body = json.loads(raw) if raw else {}
         except json.JSONDecodeError:
-            body = {}
-        message = body.get("message") or "Paystack request failed."
-        raise PaystackInitializationError(message, payload=body) from exc
+            body = {"raw": raw}
+
+        message = ""
+        if isinstance(body, dict):
+            message = body.get("message") or ""
+        if not message:
+            if raw:
+                message = f"Paystack request failed (HTTP {exc.code}): {raw[:200]}"
+            else:
+                message = f"Paystack request failed (HTTP {exc.code})."
+
+        raise PaystackInitializationError(message, payload=body, status_code=exc.code) from exc
     except error.URLError as exc:
-        raise PaystackInitializationError("Unable to reach Paystack.") from exc
+        raise PaystackInitializationError("Unable to reach Paystack.", status_code=502) from exc
 
     try:
         response_data = json.loads(raw_body) if raw_body else {}
@@ -88,11 +130,8 @@ def verify_paystack_transaction(reference):
     if not reference:
         raise PaystackVerificationError("Transaction reference is required.")
 
-    url = f"{settings.PAYSTACK_BASE_URL.rstrip('/')}/transaction/verify/{reference}"
-    headers = {
-        "Authorization": f"Bearer {secret_key}",
-        "Content-Type": "application/json",
-    }
+    url = f"{get_paystack_base_url()}/transaction/verify/{reference}"
+    headers = build_paystack_headers(secret_key)
     req = request.Request(url=url, headers=headers, method="GET")
 
     try:
@@ -134,12 +173,9 @@ def create_paystack_transfer_recipient(name, account_number, bank_code, currency
         "currency": currency,
     }
 
-    url = f"{settings.PAYSTACK_BASE_URL.rstrip('/')}/transferrecipient"
+    url = f"{get_paystack_base_url()}/transferrecipient"
     data = json.dumps(payload).encode("utf-8")
-    headers = {
-        "Authorization": f"Bearer {secret_key}",
-        "Content-Type": "application/json",
-    }
+    headers = build_paystack_headers(secret_key)
     req = request.Request(url=url, data=data, headers=headers, method="POST")
 
     try:
@@ -182,12 +218,9 @@ def initiate_paystack_transfer(amount_kobo, recipient_code, reference, reason=""
     if reason:
         payload["reason"] = reason
 
-    url = f"{settings.PAYSTACK_BASE_URL.rstrip('/')}/transfer"
+    url = f"{get_paystack_base_url()}/transfer"
     data = json.dumps(payload).encode("utf-8")
-    headers = {
-        "Authorization": f"Bearer {secret_key}",
-        "Content-Type": "application/json",
-    }
+    headers = build_paystack_headers(secret_key)
     req = request.Request(url=url, data=data, headers=headers, method="POST")
 
     try:
@@ -228,12 +261,9 @@ def initiate_paystack_refund(transaction_reference, amount_kobo=None):
     if amount_kobo is not None:
         payload["amount"] = amount_kobo
 
-    url = f"{settings.PAYSTACK_BASE_URL.rstrip('/')}/refund"
+    url = f"{get_paystack_base_url()}/refund"
     data = json.dumps(payload).encode("utf-8")
-    headers = {
-        "Authorization": f"Bearer {secret_key}",
-        "Content-Type": "application/json",
-    }
+    headers = build_paystack_headers(secret_key)
     req = request.Request(url=url, data=data, headers=headers, method="POST")
 
     try:

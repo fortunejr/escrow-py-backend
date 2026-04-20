@@ -78,6 +78,19 @@ class CreateEscrowFromListingTests(APITestCase):
             ).exists()
         )
 
+    def test_duplicate_creation_blocked(self):
+        self.authenticate(self.buyer)
+        payload = {"listing_id": self.active_listing.id}
+
+        first = self.client.post(reverse("create-escrow-from-listing"), payload, format="json")
+        second = self.client.post(reverse("create-escrow-from-listing"), payload, format="json")
+
+        self.assertEqual(first.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(second.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(second.data["success"])
+        self.assertIn("listing", second.data["errors"])
+        self.assertEqual(EscrowTransaction.objects.count(), 1)
+
     def test_inactive_listing_blocked(self):
         self.authenticate(self.buyer)
         payload = {"listing_id": self.inactive_listing.id}
@@ -407,3 +420,92 @@ class EscrowRefundTests(APITestCase):
         self.assertFalse(response.data["success"])
         self.assertEqual(RefundRecord.objects.filter(escrow=self.pending_escrow).count(), 0)
         mock_execute_refund.assert_not_called()
+
+
+class BuyerEscrowReadTests(APITestCase):
+    def setUp(self):
+        self.seller = User.objects.create_user(
+            email="buyer_read_seller@example.com",
+            password="StrongPass123!",
+            first_name="Seller",
+            last_name="Reader",
+        )
+        self.buyer = User.objects.create_user(
+            email="buyer_read_owner@example.com",
+            password="StrongPass123!",
+            first_name="Buyer",
+            last_name="Owner",
+        )
+        self.other_buyer = User.objects.create_user(
+            email="buyer_read_other@example.com",
+            password="StrongPass123!",
+            first_name="Buyer",
+            last_name="Other",
+        )
+        self.listing = Listing.objects.create(
+            seller=self.seller,
+            title="Escrow Read Listing",
+            description="Escrow read test listing",
+            listing_type=Listing.ListingType.SERVICE,
+            price=Decimal("450.00"),
+            is_active=True,
+        )
+        self.owner_escrow_one = EscrowTransaction.objects.create(
+            listing=self.listing,
+            buyer=self.buyer,
+            seller=self.seller,
+            amount=Decimal("450.00"),
+            title_snapshot="Owner Escrow One",
+            description_snapshot="Owner escrow one snapshot",
+            status=EscrowTransaction.Status.PENDING,
+        )
+        self.owner_escrow_two = EscrowTransaction.objects.create(
+            listing=self.listing,
+            buyer=self.buyer,
+            seller=self.seller,
+            amount=Decimal("550.00"),
+            title_snapshot="Owner Escrow Two",
+            description_snapshot="Owner escrow two snapshot",
+            status=EscrowTransaction.Status.FUNDED,
+        )
+        self.other_escrow = EscrowTransaction.objects.create(
+            listing=self.listing,
+            buyer=self.other_buyer,
+            seller=self.seller,
+            amount=Decimal("650.00"),
+            title_snapshot="Other Buyer Escrow",
+            description_snapshot="Other buyer escrow snapshot",
+            status=EscrowTransaction.Status.PAYMENT_PENDING,
+        )
+
+    def authenticate(self, user):
+        refresh = RefreshToken.for_user(user)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {refresh.access_token}")
+
+    def test_list_my_escrows_returns_only_authenticated_buyer_escrows(self):
+        self.authenticate(self.buyer)
+        response = self.client.get(reverse("list-my-escrows"))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["success"])
+        self.assertEqual(len(response.data["data"]), 2)
+        returned_ids = {item["id"] for item in response.data["data"]}
+        self.assertSetEqual(returned_ids, {self.owner_escrow_one.id, self.owner_escrow_two.id})
+        self.assertNotIn(self.other_escrow.id, returned_ids)
+
+    def test_buyer_escrow_detail_returns_owned_escrow(self):
+        self.authenticate(self.buyer)
+        response = self.client.get(reverse("buyer-escrow-detail", kwargs={"escrow_id": self.owner_escrow_one.id}))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["success"])
+        self.assertEqual(response.data["data"]["id"], self.owner_escrow_one.id)
+        self.assertEqual(response.data["data"]["buyer"]["id"], self.buyer.id)
+
+    def test_buyer_escrow_detail_for_other_buyer_returns_not_found(self):
+        self.authenticate(self.buyer)
+        response = self.client.get(reverse("buyer-escrow-detail", kwargs={"escrow_id": self.other_escrow.id}))
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertFalse(response.data["success"])
+        self.assertIn("escrow", response.data["errors"])

@@ -3,6 +3,7 @@ import json
 from decimal import Decimal
 from uuid import uuid4
 
+from django.conf import settings
 from django.db import IntegrityError, transaction
 from django.db.models import Q
 from django.utils import timezone
@@ -343,9 +344,11 @@ def initialize_escrow_payment_view(request):
             status=status.HTTP_400_BAD_REQUEST,
         )
 
+    escrow_amount = Decimal(escrow.amount)
     reference = generate_payment_reference(escrow.id)
-    amount_kobo = int((Decimal(escrow.amount) * Decimal("100")).quantize(Decimal("1")))
+    amount_kobo = int((escrow_amount * Decimal("100")).quantize(Decimal("1")))
     currency = "NGN"
+    callback_url = str(getattr(settings, "PAYSTACK_CALLBACK_URL", "") or "").strip() or None
 
     try:
         paystack_response = initialize_paystack_transaction(
@@ -353,6 +356,7 @@ def initialize_escrow_payment_view(request):
             amount_kobo=amount_kobo,
             reference=reference,
             currency=currency,
+            callback_url=callback_url,
             metadata={
                 "escrow_id": escrow.id,
                 "buyer_id": escrow.buyer_id,
@@ -363,12 +367,21 @@ def initialize_escrow_payment_view(request):
         error_code = status.HTTP_500_INTERNAL_SERVER_ERROR
         if "Unable to reach Paystack." in str(exc):
             error_code = status.HTTP_502_BAD_GATEWAY
+
+        provider_errors = [str(exc)]
+        if getattr(exc, "status_code", None):
+            provider_errors.append(f"Paystack HTTP status: {exc.status_code}")
+        if isinstance(getattr(exc, "payload", None), dict):
+            paystack_message = exc.payload.get("message")
+            if isinstance(paystack_message, str) and paystack_message and paystack_message not in provider_errors:
+                provider_errors.append(f"Paystack response: {paystack_message}")
+
         return Response(
             build_response(
                 False,
                 "Payment initialization failed.",
                 data=None,
-                errors={"provider": [str(exc)]},
+                errors={"provider": provider_errors},
             ),
             status=error_code,
         )
@@ -377,61 +390,55 @@ def initialize_escrow_payment_view(request):
     authorization_url = paystack_data.get("authorization_url")
 
     with transaction.atomic():
-        locked_escrow = (
+        escrow_locked = (
             EscrowTransaction.objects.select_for_update()
             .select_related("buyer", "seller")
             .filter(id=escrow.id)
             .first()
         )
-        if not locked_escrow:
+        if not escrow_locked:
             return Response(
                 build_response(False, "Escrow not found.", data=None, errors={"escrow": ["Escrow does not exist."]}),
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        if locked_escrow.status not in valid_statuses:
+        if escrow_locked.buyer_id != request.user.id:
+            return Response(
+                build_response(
+                    False,
+                    "Permission denied.",
+                    data=None,
+                    errors={"permission": ["Only the escrow buyer can initialize payment."]},
+                ),
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        if escrow_locked.status not in valid_statuses:
             return Response(
                 build_response(
                     False,
                     "Payment initialization failed.",
                     data=None,
-                    errors={"escrow": [f"Escrow cannot be paid in '{locked_escrow.status}' status."]},
+                    errors={"escrow": [f"Escrow cannot be paid in '{escrow_locked.status}' status."]},
                 ),
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        payment_record = (
-            PaymentRecord.objects.select_for_update()
-            .filter(escrow=locked_escrow)
-            .order_by("-created_at")
-            .first()
+        payment_record = PaymentRecord.objects.create(
+            escrow=escrow_locked,
+            provider=PaymentRecord.Provider.PAYSTACK,
+            reference=reference,
+            amount=escrow_locked.amount,
+            currency=currency,
+            status=PaymentRecord.Status.INITIALIZED,
+            authorization_url=authorization_url,
+            gateway_metadata=paystack_data,
         )
 
-        if payment_record:
-            payment_record.provider = PaymentRecord.Provider.PAYSTACK
-            payment_record.reference = reference
-            payment_record.amount = locked_escrow.amount
-            payment_record.currency = currency
-            payment_record.status = PaymentRecord.Status.INITIALIZED
-            payment_record.authorization_url = authorization_url
-            payment_record.gateway_metadata = paystack_data
-            payment_record.save()
-        else:
-            payment_record = PaymentRecord.objects.create(
-                escrow=locked_escrow,
-                provider=PaymentRecord.Provider.PAYSTACK,
-                reference=reference,
-                amount=locked_escrow.amount,
-                currency=currency,
-                status=PaymentRecord.Status.INITIALIZED,
-                authorization_url=authorization_url,
-                gateway_metadata=paystack_data,
-            )
-
-        if locked_escrow.status == EscrowTransaction.Status.PENDING:
-            locked_escrow.status = EscrowTransaction.Status.PAYMENT_PENDING
-            locked_escrow.save(update_fields=["status", "updated_at"])
-        escrow_status = locked_escrow.status
+        if escrow_locked.status == EscrowTransaction.Status.PENDING:
+            escrow_locked.status = EscrowTransaction.Status.PAYMENT_PENDING
+            escrow_locked.save(update_fields=["status", "updated_at"])
+        escrow_status = escrow_locked.status
 
     log_audit_event(
         actor=request.user,

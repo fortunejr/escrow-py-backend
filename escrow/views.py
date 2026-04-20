@@ -123,6 +123,21 @@ def create_escrow_from_listing_view(request):
             status=status.HTTP_400_BAD_REQUEST,
         )
 
+    duplicate_escrow = EscrowTransaction.objects.filter(
+        listing_id=listing.id,
+        buyer_id=request.user.id,
+    ).exists()
+    if duplicate_escrow:
+        return Response(
+            build_response(
+                False,
+                "Escrow creation failed.",
+                data=None,
+                errors={"listing": ["You already created an escrow for this listing."]},
+            ),
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
     escrow = EscrowTransaction.objects.create(
         listing=listing,
         buyer=request.user,
@@ -150,6 +165,43 @@ def create_escrow_from_listing_view(request):
     return Response(
         build_response(True, "Escrow created successfully.", data=data, errors=None),
         status=status.HTTP_201_CREATED,
+    )
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def list_my_escrows_view(request):
+    """Authenticated endpoint for the current buyer's escrow transactions."""
+    escrows = (
+        EscrowTransaction.objects.filter(buyer=request.user)
+        .select_related("listing", "buyer", "seller")
+    )
+    data = EscrowTransactionSerializer(escrows, many=True).data
+    return Response(
+        build_response(True, "My escrows fetched successfully.", data=data, errors=None),
+        status=status.HTTP_200_OK,
+    )
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def buyer_escrow_detail_view(request, escrow_id):
+    """Authenticated endpoint for one buyer-owned escrow transaction."""
+    escrow = (
+        EscrowTransaction.objects.filter(id=escrow_id, buyer=request.user)
+        .select_related("listing", "buyer", "seller")
+        .first()
+    )
+    if not escrow:
+        return Response(
+            build_response(False, "Escrow not found.", data=None, errors={"escrow": ["Escrow does not exist."]}),
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    data = EscrowTransactionSerializer(escrow).data
+    return Response(
+        build_response(True, "Escrow detail fetched successfully.", data=data, errors=None),
+        status=status.HTTP_200_OK,
     )
 
 
