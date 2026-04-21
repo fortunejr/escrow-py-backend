@@ -222,6 +222,62 @@ def list_seller_escrows_view(request):
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
+def list_admin_escrows_view(request):
+    """Admin-only endpoint for all escrow transactions."""
+    if not request.user.is_staff:
+        return Response(
+            build_response(
+                False,
+                "Permission denied.",
+                data=None,
+                errors={"permission": ["Only admin users can access all escrows."]},
+            ),
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    escrows = EscrowTransaction.objects.select_related("listing", "buyer", "seller").all()
+    data = EscrowTransactionSerializer(escrows, many=True).data
+    return Response(
+        build_response(True, "Admin escrows fetched successfully.", data=data, errors=None),
+        status=status.HTTP_200_OK,
+    )
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def admin_escrow_detail_view(request, escrow_id):
+    """Admin-only endpoint for one escrow transaction."""
+    if not request.user.is_staff:
+        return Response(
+            build_response(
+                False,
+                "Permission denied.",
+                data=None,
+                errors={"permission": ["Only admin users can access escrow detail."]},
+            ),
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    escrow = (
+        EscrowTransaction.objects.filter(id=escrow_id)
+        .select_related("listing", "buyer", "seller")
+        .first()
+    )
+    if not escrow:
+        return Response(
+            build_response(False, "Escrow not found.", data=None, errors={"escrow": ["Escrow does not exist."]}),
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    data = EscrowTransactionSerializer(escrow).data
+    return Response(
+        build_response(True, "Admin escrow detail fetched successfully.", data=data, errors=None),
+        status=status.HTTP_200_OK,
+    )
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
 def seller_escrow_detail_view(request, escrow_id):
     """Authenticated endpoint for one seller-owned escrow transaction."""
     escrow = (

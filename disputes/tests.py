@@ -298,3 +298,75 @@ class AdminDisputeResolutionTests(APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertFalse(response.data["success"])
+
+
+class AdminDisputeListTests(APITestCase):
+    def setUp(self):
+        self.admin = User.objects.create_user(
+            email="admin_dispute_list@example.com",
+            password="StrongPass123!",
+            first_name="Admin",
+            last_name="DisputeList",
+            is_staff=True,
+        )
+        self.non_admin = User.objects.create_user(
+            email="non_admin_dispute_list@example.com",
+            password="StrongPass123!",
+            first_name="Non",
+            last_name="Admin",
+        )
+        self.seller = User.objects.create_user(
+            email="admin_dispute_list_seller@example.com",
+            password="StrongPass123!",
+            first_name="Seller",
+            last_name="User",
+        )
+        self.buyer = User.objects.create_user(
+            email="admin_dispute_list_buyer@example.com",
+            password="StrongPass123!",
+            first_name="Buyer",
+            last_name="User",
+        )
+        listing = Listing.objects.create(
+            seller=self.seller,
+            title="Admin Dispute List Listing",
+            description="Admin dispute list test listing",
+            listing_type=Listing.ListingType.PRODUCT,
+            price=Decimal("750.00"),
+            is_active=True,
+        )
+        escrow = EscrowTransaction.objects.create(
+            listing=listing,
+            buyer=self.buyer,
+            seller=self.seller,
+            amount=listing.price,
+            title_snapshot=listing.title,
+            description_snapshot=listing.description,
+            status=EscrowTransaction.Status.DISPUTED,
+        )
+        Dispute.objects.create(
+            escrow=escrow,
+            raised_by=self.buyer,
+            reason="Admin list endpoint test",
+            status=Dispute.Status.OPEN,
+        )
+
+    def authenticate(self, user):
+        refresh = RefreshToken.for_user(user)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {refresh.access_token}")
+
+    def test_admin_can_list_all_disputes(self):
+        self.authenticate(self.admin)
+        response = self.client.get(reverse("list-admin-disputes"))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["success"])
+        self.assertEqual(len(response.data["data"]), 1)
+
+    def test_non_admin_cannot_list_all_disputes(self):
+        self.authenticate(self.non_admin)
+        response = self.client.get(reverse("list-admin-disputes"))
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertFalse(response.data["success"])
+        self.assertIn("permission", response.data["errors"])

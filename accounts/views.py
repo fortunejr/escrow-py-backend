@@ -27,6 +27,7 @@ def serialize_user(user):
         "email": user.email,
         "first_name": user.first_name,
         "last_name": user.last_name,
+        "is_staff": user.is_staff,
         "is_active": user.is_active,
         "date_joined": user.date_joined,
     }
@@ -185,10 +186,102 @@ def token_refresh_view(request):
     )
 
 
-@api_view(["GET"])
+@api_view(["GET", "PATCH"])
 @permission_classes([IsAuthenticated])
 def profile_view(request):
+    if request.method == "PATCH":
+        first_name = request.data.get("first_name")
+        last_name = request.data.get("last_name")
+        email = request.data.get("email")
+
+        errors = {}
+
+        if first_name is None or not isinstance(first_name, str):
+            errors["first_name"] = ["first_name is required."]
+        if last_name is None or not isinstance(last_name, str):
+            errors["last_name"] = ["last_name is required."]
+
+        if email is None or not isinstance(email, str):
+            errors["email"] = ["email is required."]
+        else:
+            email = email.strip().lower()
+            try:
+                validate_email(email)
+            except ValidationError:
+                errors["email"] = ["Enter a valid email address."]
+
+        if isinstance(email, str) and email and User.objects.filter(email__iexact=email).exclude(id=request.user.id).exists():
+            errors["email"] = ["An account with this email already exists."]
+
+        if errors:
+            return Response(
+                build_response(False, "Profile update failed.", data=None, errors=errors),
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        request.user.first_name = first_name.strip()
+        request.user.last_name = last_name.strip()
+        request.user.email = email
+        request.user.save(update_fields=["first_name", "last_name", "email"])
+
+        return Response(
+            build_response(True, "Profile updated successfully.", data=serialize_user(request.user), errors=None),
+            status=status.HTTP_200_OK,
+        )
+
     return Response(
         build_response(True, "Profile fetched successfully.", data=serialize_user(request.user), errors=None),
+        status=status.HTTP_200_OK,
+    )
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def change_password_view(request):
+    current_password = request.data.get("current_password")
+    new_password = request.data.get("new_password")
+
+    errors = {}
+
+    if not current_password or not isinstance(current_password, str):
+        errors["current_password"] = ["current_password is required."]
+    if not new_password or not isinstance(new_password, str):
+        errors["new_password"] = ["new_password is required."]
+
+    if errors:
+        return Response(
+            build_response(False, "Password change failed.", data=None, errors=errors),
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    if not request.user.check_password(current_password):
+        return Response(
+            build_response(
+                False,
+                "Password change failed.",
+                data=None,
+                errors={"current_password": ["Current password is incorrect."]},
+            ),
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    try:
+        validate_password(new_password, user=request.user)
+    except ValidationError as exc:
+        return Response(
+            build_response(
+                False,
+                "Password change failed.",
+                data=None,
+                errors={"new_password": list(exc.messages)},
+            ),
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    request.user.set_password(new_password)
+    request.user.save(update_fields=["password"])
+
+    return Response(
+        build_response(True, "Password updated successfully.", data=None, errors=None),
         status=status.HTTP_200_OK,
     )

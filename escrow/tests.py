@@ -612,3 +612,94 @@ class SellerEscrowReadTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
         self.assertFalse(response.data["success"])
         self.assertIn("escrow", response.data["errors"])
+
+
+class AdminEscrowReadTests(APITestCase):
+    def setUp(self):
+        self.admin = User.objects.create_user(
+            email="admin_escrow_reader@example.com",
+            password="StrongPass123!",
+            first_name="Admin",
+            last_name="Reader",
+            is_staff=True,
+        )
+        self.non_admin = User.objects.create_user(
+            email="non_admin_escrow_reader@example.com",
+            password="StrongPass123!",
+            first_name="Non",
+            last_name="Admin",
+        )
+        self.seller = User.objects.create_user(
+            email="admin_escrow_seller@example.com",
+            password="StrongPass123!",
+            first_name="Escrow",
+            last_name="Seller",
+        )
+        self.buyer = User.objects.create_user(
+            email="admin_escrow_buyer@example.com",
+            password="StrongPass123!",
+            first_name="Escrow",
+            last_name="Buyer",
+        )
+        self.listing = Listing.objects.create(
+            seller=self.seller,
+            title="Admin Escrow Listing",
+            description="Admin escrow list/detail test",
+            listing_type=Listing.ListingType.PRODUCT,
+            price=Decimal("1000.00"),
+            is_active=True,
+        )
+        self.escrow = EscrowTransaction.objects.create(
+            listing=self.listing,
+            buyer=self.buyer,
+            seller=self.seller,
+            amount=Decimal("1000.00"),
+            title_snapshot=self.listing.title,
+            description_snapshot=self.listing.description,
+            status=EscrowTransaction.Status.FUNDED,
+        )
+
+    def authenticate(self, user):
+        refresh = RefreshToken.for_user(user)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {refresh.access_token}")
+
+    def test_admin_can_list_all_escrows(self):
+        self.authenticate(self.admin)
+        response = self.client.get(reverse("list-admin-escrows"))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["success"])
+        self.assertEqual(len(response.data["data"]), 1)
+        self.assertEqual(response.data["data"][0]["id"], self.escrow.id)
+
+    def test_non_admin_cannot_list_all_escrows(self):
+        self.authenticate(self.non_admin)
+        response = self.client.get(reverse("list-admin-escrows"))
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertFalse(response.data["success"])
+        self.assertIn("permission", response.data["errors"])
+
+    def test_admin_can_fetch_escrow_detail(self):
+        self.authenticate(self.admin)
+        response = self.client.get(reverse("admin-escrow-detail", kwargs={"escrow_id": self.escrow.id}))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["success"])
+        self.assertEqual(response.data["data"]["id"], self.escrow.id)
+
+    def test_non_admin_cannot_fetch_escrow_detail(self):
+        self.authenticate(self.non_admin)
+        response = self.client.get(reverse("admin-escrow-detail", kwargs={"escrow_id": self.escrow.id}))
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertFalse(response.data["success"])
+        self.assertIn("permission", response.data["errors"])
+
+    def test_admin_escrow_detail_returns_not_found_for_missing_escrow(self):
+        self.authenticate(self.admin)
+        response = self.client.get(reverse("admin-escrow-detail", kwargs={"escrow_id": 999999}))
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertFalse(response.data["success"])
+        self.assertIn("escrow", response.data["errors"])

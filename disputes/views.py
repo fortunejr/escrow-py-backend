@@ -206,6 +206,29 @@ def list_disputes_view(request):
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
+def list_admin_disputes_view(request):
+    """Admin-only list of all disputes."""
+    if not request.user.is_staff:
+        return Response(
+            build_response(
+                False,
+                "Permission denied.",
+                data=None,
+                errors={"permission": ["Only admin users can access all disputes."]},
+            ),
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    disputes = Dispute.objects.select_related("escrow", "raised_by").all()
+    data = DisputeSerializer(disputes, many=True).data
+    return Response(
+        build_response(True, "Admin disputes fetched successfully.", data=data, errors=None),
+        status=status.HTTP_200_OK,
+    )
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
 def dispute_detail_view(request, dispute_id):
     """Return one dispute if requester is involved or an admin."""
     dispute = Dispute.objects.select_related("escrow", "raised_by").filter(id=dispute_id).first()
