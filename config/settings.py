@@ -31,7 +31,11 @@ SECRET_KEY = 'django-insecure-4h-vd1th)b(hr-m5^k59qeh28q_=3b(0%ik17m)623vi(t9v=6
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = ["127.0.0.1", "localhost", "testserver"]
+ALLOWED_HOSTS = ["127.0.0.1", "localhost", "testserver", ".ngrok-free.dev",]
+
+CSRF_TRUSTED_ORIGINS = [
+    "https://*.ngrok-free.dev",
+]
 
 
 # Application definition
@@ -176,4 +180,19 @@ PAYSTACK_CALLBACK_URL = os.getenv(
 )
 
 # Only for development testing - never use in production
-CORS_ALLOW_ALL_ORIGINS = True
+# CORS_ALLOW_ALL_ORIGINS = True
+
+
+CORS_ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:8080",
+    "http://127.0.0.1:8080",
+]
+
+# # Allow temporary ngrok frontends without editing settings on every tunnel change.
+# CORS_ALLOWED_ORIGIN_REGEXES = [
+#     r"^https?://localhost(:\d+)?$",
+#     r"^https?://127\.0\.0\.1(:\d+)?$",
+#     r"^https://[a-z0-9-]+\.ngrok-free\.dev$",
+# ]

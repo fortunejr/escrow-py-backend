@@ -15,7 +15,8 @@ from core.models import AuditLog
 from escrow.models import EscrowTransaction
 from listings.models import Listing
 
-from .models import PaymentRecord, PaystackWebhookEvent, PayoutRecord, SellerPayoutDetail
+from .models import PaymentRecord, PaystackWebhookEvent, PayoutRecord, RefundRecord, SellerPayoutDetail
+from .paystack import PaystackPayoutError
 
 
 User = get_user_model()
@@ -434,6 +435,147 @@ class PaymentVerificationTests(APITestCase):
         mock_verify.assert_called_once()
 
 
+@override_settings(PAYSTACK_SECRET_KEY="sk_test_webhook_secret")
+class RefundWebhookUpdateTests(APITestCase):
+    def setUp(self):
+        self.seller = User.objects.create_user(
+            email="seller_refund_webhook@example.com",
+            password="StrongPass123!",
+            first_name="Seller",
+            last_name="RefundWebhook",
+        )
+        self.buyer = User.objects.create_user(
+            email="buyer_refund_webhook@example.com",
+            password="StrongPass123!",
+            first_name="Buyer",
+            last_name="RefundWebhook",
+        )
+        self.listing = Listing.objects.create(
+            seller=self.seller,
+            title="Refund Webhook Listing",
+            description="Webhook-driven refund status update",
+            listing_type=Listing.ListingType.PRODUCT,
+            price=Decimal("2100.00"),
+            is_active=True,
+        )
+        self.escrow = EscrowTransaction.objects.create(
+            listing=self.listing,
+            buyer=self.buyer,
+            seller=self.seller,
+            amount=self.listing.price,
+            title_snapshot=self.listing.title,
+            description_snapshot=self.listing.description,
+            status=EscrowTransaction.Status.FUNDED,
+        )
+        self.payment = PaymentRecord.objects.create(
+            escrow=self.escrow,
+            provider=PaymentRecord.Provider.PAYSTACK,
+            reference="pay_ref_refund_webhook_001",
+            amount=self.escrow.amount,
+            currency="NGN",
+            status=PaymentRecord.Status.SUCCESS,
+        )
+        self.refund = RefundRecord.objects.create(
+            escrow=self.escrow,
+            reference="refund_local_ref_001",
+            provider_reference="778899",
+            amount=self.escrow.amount,
+            currency="NGN",
+            status=RefundRecord.Status.PROCESSING,
+            initiated_by=self.buyer,
+            metadata={"payment_reference": self.payment.reference},
+        )
+
+    def sign_payload(self, payload):
+        raw_body = json.dumps(payload).encode("utf-8")
+        signature = hmac.new(
+            key=b"sk_test_webhook_secret",
+            msg=raw_body,
+            digestmod=hashlib.sha512,
+        ).hexdigest()
+        return raw_body, signature
+
+    def test_refund_processed_webhook_marks_refund_success(self):
+        payload = {
+            "event": "refund.processed",
+            "data": {
+                "id": 778899,
+                "status": "processed",
+                "transaction_reference": self.payment.reference,
+                "refund_reference": self.refund.reference,
+            },
+        }
+        raw_body, signature = self.sign_payload(payload)
+
+        response = self.client.post(
+            reverse("paystack-webhook"),
+            data=raw_body,
+            content_type="application/json",
+            HTTP_X_PAYSTACK_SIGNATURE=signature,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["success"])
+
+        self.refund.refresh_from_db()
+        self.escrow.refresh_from_db()
+        self.assertEqual(self.refund.status, RefundRecord.Status.SUCCESS)
+        self.assertIsNotNone(self.refund.processed_at)
+        self.assertEqual(self.escrow.status, EscrowTransaction.Status.REFUNDED)
+        self.assertEqual(PaystackWebhookEvent.objects.count(), 1)
+
+    def test_refund_processing_webhook_keeps_refund_not_success(self):
+        self.refund.status = RefundRecord.Status.PENDING
+        self.refund.save(update_fields=["status", "updated_at"])
+
+        payload = {
+            "event": "refund.processing",
+            "data": {
+                "id": 778899,
+                "status": "processing",
+                "transaction_reference": self.payment.reference,
+            },
+        }
+        raw_body, signature = self.sign_payload(payload)
+
+        response = self.client.post(
+            reverse("paystack-webhook"),
+            data=raw_body,
+            content_type="application/json",
+            HTTP_X_PAYSTACK_SIGNATURE=signature,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["success"])
+
+        self.refund.refresh_from_db()
+        self.escrow.refresh_from_db()
+        self.assertEqual(self.refund.status, RefundRecord.Status.PROCESSING)
+        self.assertEqual(self.escrow.status, EscrowTransaction.Status.FUNDED)
+
+    def test_refund_webhook_without_matching_record_returns_safe_200(self):
+        payload = {
+            "event": "refund.processed",
+            "data": {
+                "id": 1234567,
+                "status": "processed",
+                "transaction_reference": "unknown_payment_reference",
+            },
+        }
+        raw_body, signature = self.sign_payload(payload)
+
+        response = self.client.post(
+            reverse("paystack-webhook"),
+            data=raw_body,
+            content_type="application/json",
+            HTTP_X_PAYSTACK_SIGNATURE=signature,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["success"])
+        self.assertEqual(response.data["message"], "Refund webhook received with no matching refund record.")
+
+
 @override_settings(PAYSTACK_SECRET_KEY="sk_test_payout_secret")
 class PaystackPayoutIntegrationTests(APITestCase):
     def setUp(self):
@@ -503,10 +645,17 @@ class PaystackPayoutIntegrationTests(APITestCase):
 
     @patch("payments.views.initiate_paystack_transfer")
     @patch("payments.views.create_paystack_transfer_recipient")
-    def test_payout_execution_success_path(self, mock_create_recipient, mock_transfer):
+    @patch("payments.views.resolve_paystack_account")
+    def test_payout_execution_success_path(self, mock_resolve_account, mock_create_recipient, mock_transfer):
         payout = self.create_payout_request()
         self.add_seller_payout_details()
 
+        mock_resolve_account.return_value = {
+            "status": True,
+            "data": {
+                "account_name": "Payout Seller",
+            },
+        }
         mock_create_recipient.return_value = {
             "status": True,
             "data": {
@@ -538,6 +687,7 @@ class PaystackPayoutIntegrationTests(APITestCase):
         self.assertEqual(payout.provider_reference, "TRF_test_456")
         self.assertEqual(self.escrow.status, EscrowTransaction.Status.COMPLETED)
         self.assertEqual(detail.recipient_code, "RCP_test_123")
+        mock_resolve_account.assert_called_once()
         mock_create_recipient.assert_called_once()
         mock_transfer.assert_called_once()
         self.assertTrue(
@@ -550,10 +700,17 @@ class PaystackPayoutIntegrationTests(APITestCase):
 
     @patch("payments.views.initiate_paystack_transfer")
     @patch("payments.views.create_paystack_transfer_recipient")
-    def test_duplicate_payout_prevention(self, mock_create_recipient, mock_transfer):
+    @patch("payments.views.resolve_paystack_account")
+    def test_duplicate_payout_prevention(self, mock_resolve_account, mock_create_recipient, mock_transfer):
         payout = self.create_payout_request()
         self.add_seller_payout_details()
 
+        mock_resolve_account.return_value = {
+            "status": True,
+            "data": {
+                "account_name": "Payout Seller",
+            },
+        }
         mock_create_recipient.return_value = {
             "status": True,
             "data": {
@@ -578,7 +735,52 @@ class PaystackPayoutIntegrationTests(APITestCase):
         self.assertEqual(first.status_code, status.HTTP_200_OK)
         self.assertEqual(second.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertFalse(second.data["success"])
+        mock_resolve_account.assert_called_once()
         mock_transfer.assert_called_once()
+
+    @patch("payments.views.initiate_paystack_transfer")
+    @patch("payments.views.create_paystack_transfer_recipient")
+    @patch("payments.views.resolve_paystack_account")
+    def test_account_resolution_failure_returns_400(self, mock_resolve_account, mock_create_recipient, mock_transfer):
+        payout = self.create_payout_request()
+        self.add_seller_payout_details()
+        mock_resolve_account.side_effect = PaystackPayoutError(
+            "Cannot resolve account",
+            payload={"message": "Cannot resolve account"},
+            status_code=400,
+        )
+
+        self.authenticate(self.seller)
+        response = self.client.post(reverse("execute-payout", kwargs={"payout_id": payout.id}), {}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(response.data["success"])
+        self.assertIn("payout_details", response.data["errors"])
+        payout.refresh_from_db()
+        self.assertEqual(payout.status, PayoutRecord.Status.FAILED)
+        self.assertEqual((payout.metadata or {}).get("last_error", {}).get("message"), "Cannot resolve account")
+        self.assertEqual((payout.metadata or {}).get("last_error", {}).get("details", {}).get("stage"), "account_resolve")
+        mock_create_recipient.assert_not_called()
+        mock_transfer.assert_not_called()
+
+    @patch("payments.views.initiate_paystack_transfer")
+    @patch("payments.views.create_paystack_transfer_recipient")
+    @patch("payments.views.resolve_paystack_account")
+    def test_account_resolution_network_failure_returns_502(self, mock_resolve_account, mock_create_recipient, mock_transfer):
+        payout = self.create_payout_request()
+        self.add_seller_payout_details()
+        mock_resolve_account.side_effect = PaystackPayoutError("Unable to reach Paystack.", status_code=502)
+
+        self.authenticate(self.seller)
+        response = self.client.post(reverse("execute-payout", kwargs={"payout_id": payout.id}), {}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_502_BAD_GATEWAY)
+        self.assertFalse(response.data["success"])
+        self.assertIn("provider", response.data["errors"])
+        payout.refresh_from_db()
+        self.assertEqual(payout.status, PayoutRecord.Status.FAILED)
+        mock_create_recipient.assert_not_called()
+        mock_transfer.assert_not_called()
 
     def test_missing_payout_details_blocked(self):
         payout = self.create_payout_request()
@@ -616,3 +818,155 @@ class PaystackPayoutIntegrationTests(APITestCase):
         self.assertEqual(detail.account_number, "9998887776")
         self.assertIsNone(detail.recipient_code)
         self.assertIsNone(detail.recipient_reference)
+
+
+class SellerPayoutReadTests(APITestCase):
+    def setUp(self):
+        self.seller = User.objects.create_user(
+            email="seller_read_payouts@example.com",
+            password="StrongPass123!",
+            first_name="Seller",
+            last_name="Reader",
+        )
+        self.other_seller = User.objects.create_user(
+            email="other_seller_read_payouts@example.com",
+            password="StrongPass123!",
+            first_name="Other",
+            last_name="Seller",
+        )
+        self.buyer = User.objects.create_user(
+            email="buyer_read_payouts@example.com",
+            password="StrongPass123!",
+            first_name="Buyer",
+            last_name="Reader",
+        )
+        self.listing = Listing.objects.create(
+            seller=self.seller,
+            title="Seller Payout Read Listing",
+            description="Seller payout read test listing",
+            listing_type=Listing.ListingType.PRODUCT,
+            price=Decimal("1200.00"),
+            is_active=True,
+        )
+        self.other_listing = Listing.objects.create(
+            seller=self.other_seller,
+            title="Other Seller Payout Listing",
+            description="Other seller payout read listing",
+            listing_type=Listing.ListingType.SERVICE,
+            price=Decimal("900.00"),
+            is_active=True,
+        )
+        self.escrow_one = EscrowTransaction.objects.create(
+            listing=self.listing,
+            buyer=self.buyer,
+            seller=self.seller,
+            amount=Decimal("1200.00"),
+            title_snapshot=self.listing.title,
+            description_snapshot=self.listing.description,
+            status=EscrowTransaction.Status.RELEASED,
+        )
+        self.escrow_two = EscrowTransaction.objects.create(
+            listing=self.listing,
+            buyer=self.buyer,
+            seller=self.seller,
+            amount=Decimal("800.00"),
+            title_snapshot="Second Payout Escrow",
+            description_snapshot="Second payout escrow snapshot",
+            status=EscrowTransaction.Status.COMPLETED,
+        )
+        self.other_escrow = EscrowTransaction.objects.create(
+            listing=self.other_listing,
+            buyer=self.buyer,
+            seller=self.other_seller,
+            amount=Decimal("900.00"),
+            title_snapshot=self.other_listing.title,
+            description_snapshot=self.other_listing.description,
+            status=EscrowTransaction.Status.RELEASED,
+        )
+        self.payout_one = PayoutRecord.objects.create(
+            escrow=self.escrow_one,
+            reference="payout_read_001",
+            amount=Decimal("1200.00"),
+            currency="NGN",
+            status=PayoutRecord.Status.PENDING,
+            initiated_by=self.buyer,
+        )
+        self.payout_two = PayoutRecord.objects.create(
+            escrow=self.escrow_two,
+            reference="payout_read_002",
+            amount=Decimal("800.00"),
+            currency="NGN",
+            status=PayoutRecord.Status.SUCCESS,
+            initiated_by=self.buyer,
+        )
+        self.other_payout = PayoutRecord.objects.create(
+            escrow=self.other_escrow,
+            reference="payout_read_003",
+            amount=Decimal("900.00"),
+            currency="NGN",
+            status=PayoutRecord.Status.PROCESSING,
+            initiated_by=self.buyer,
+        )
+        SellerPayoutDetail.objects.create(
+            user=self.seller,
+            bank_code="058",
+            account_number="0123456789",
+            account_name="Seller Reader",
+            currency="NGN",
+            is_active=True,
+        )
+
+    def authenticate(self, user):
+        refresh = RefreshToken.for_user(user)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {refresh.access_token}")
+
+    def test_get_my_payout_details_returns_payload_when_record_exists(self):
+        self.authenticate(self.seller)
+        response = self.client.get(reverse("upsert-seller-payout-detail"))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["success"])
+        self.assertEqual(response.data["data"]["bank_code"], "058")
+        self.assertEqual(response.data["data"]["account_number"], "0123456789")
+
+    def test_get_my_payout_details_returns_empty_object_when_missing(self):
+        self.authenticate(self.other_seller)
+        response = self.client.get(reverse("upsert-seller-payout-detail"))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["success"])
+        self.assertEqual(response.data["data"], {})
+
+    def test_get_my_payout_details_requires_authentication(self):
+        response = self.client.get(reverse("upsert-seller-payout-detail"))
+
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_list_my_payouts_returns_only_authenticated_seller_records(self):
+        self.authenticate(self.seller)
+        response = self.client.get(reverse("list-my-payouts"))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["success"])
+        self.assertEqual(len(response.data["data"]), 2)
+        returned_ids = {item["id"] for item in response.data["data"]}
+        self.assertSetEqual(returned_ids, {self.payout_one.id, self.payout_two.id})
+        self.assertNotIn(self.other_payout.id, returned_ids)
+
+    def test_my_payout_detail_returns_seller_owned_record(self):
+        self.authenticate(self.seller)
+        response = self.client.get(reverse("my-payout-detail", kwargs={"payout_id": self.payout_one.id}))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["success"])
+        self.assertEqual(response.data["data"]["id"], self.payout_one.id)
+        self.assertEqual(response.data["data"]["escrow"]["id"], self.escrow_one.id)
+        self.assertEqual(response.data["data"]["destination"]["account_number"], "0123456789")
+
+    def test_my_payout_detail_for_other_seller_returns_not_found(self):
+        self.authenticate(self.seller)
+        response = self.client.get(reverse("my-payout-detail", kwargs={"payout_id": self.other_payout.id}))
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertFalse(response.data["success"])
+        self.assertIn("payout", response.data["errors"])

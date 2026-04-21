@@ -61,7 +61,7 @@ def create_refund_record_for_escrow(escrow, initiated_by, payment_reference, rea
 
 def map_paystack_refund_status(paystack_status):
     normalized = str(paystack_status or "").lower()
-    if normalized == "success":
+    if normalized in {"success", "processed"}:
         return RefundRecord.Status.SUCCESS
     if normalized in {"processing", "pending"}:
         return RefundRecord.Status.PROCESSING

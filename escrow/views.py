@@ -205,6 +205,43 @@ def buyer_escrow_detail_view(request, escrow_id):
     )
 
 
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def list_seller_escrows_view(request):
+    """Authenticated endpoint for the current seller's escrow transactions."""
+    escrows = (
+        EscrowTransaction.objects.filter(seller=request.user)
+        .select_related("listing", "buyer", "seller")
+    )
+    data = EscrowTransactionSerializer(escrows, many=True).data
+    return Response(
+        build_response(True, "Seller escrows fetched successfully.", data=data, errors=None),
+        status=status.HTTP_200_OK,
+    )
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def seller_escrow_detail_view(request, escrow_id):
+    """Authenticated endpoint for one seller-owned escrow transaction."""
+    escrow = (
+        EscrowTransaction.objects.filter(id=escrow_id, seller=request.user)
+        .select_related("listing", "buyer", "seller")
+        .first()
+    )
+    if not escrow:
+        return Response(
+            build_response(False, "Escrow not found.", data=None, errors={"escrow": ["Escrow does not exist."]}),
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    data = EscrowTransactionSerializer(escrow).data
+    return Response(
+        build_response(True, "Escrow detail fetched successfully.", data=data, errors=None),
+        status=status.HTTP_200_OK,
+    )
+
+
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def release_escrow_view(request, escrow_id):

@@ -16,7 +16,7 @@ from core.audit import log_audit_event
 from core.models import AuditLog
 from escrow.models import EscrowTransaction
 
-from .models import PaymentRecord, PaystackWebhookEvent, PayoutRecord, SellerPayoutDetail
+from .models import PaymentRecord, PaystackWebhookEvent, PayoutRecord, RefundRecord, SellerPayoutDetail
 from .paystack import (
     PaystackInitializationError,
     PaystackPayoutError,
@@ -24,6 +24,7 @@ from .paystack import (
     create_paystack_transfer_recipient,
     initialize_paystack_transaction,
     initiate_paystack_transfer,
+    resolve_paystack_account,
     verify_paystack_signature,
     verify_paystack_transaction,
 )
@@ -71,6 +72,24 @@ def payout_record_payload(record):
     }
 
 
+def refund_record_payload(record):
+    return {
+        "id": record.id,
+        "escrow_id": record.escrow_id,
+        "reference": record.reference,
+        "provider_reference": record.provider_reference,
+        "amount": str(record.amount),
+        "currency": record.currency,
+        "status": record.status,
+        "reason": record.reason,
+        "initiated_by": record.initiated_by_id,
+        "processed_at": record.processed_at,
+        "metadata": record.metadata,
+        "created_at": record.created_at,
+        "updated_at": record.updated_at,
+    }
+
+
 def seller_payout_detail_payload(detail):
     return {
         "id": detail.id,
@@ -85,6 +104,18 @@ def seller_payout_detail_payload(detail):
         "is_active": detail.is_active,
         "created_at": detail.created_at,
         "updated_at": detail.updated_at,
+    }
+
+
+def payout_escrow_summary_payload(escrow):
+    buyer_name = f"{escrow.buyer.first_name} {escrow.buyer.last_name}".strip() or escrow.buyer.email
+    seller_name = f"{escrow.seller.first_name} {escrow.seller.last_name}".strip() or escrow.seller.email
+    return {
+        "id": escrow.id,
+        "status": escrow.status,
+        "title_snapshot": escrow.title_snapshot,
+        "buyer_name": buyer_name,
+        "seller_name": seller_name,
     }
 
 
@@ -122,6 +153,55 @@ def map_transfer_status(paystack_transfer_status):
     return PayoutRecord.Status.PROCESSING
 
 
+def map_refund_webhook_status(event_type, payload_status):
+    normalized = str(payload_status or "").strip().lower()
+    if not normalized and isinstance(event_type, str) and event_type.startswith("refund."):
+        normalized = event_type.split(".", 1)[1].strip().lower()
+
+    normalized = normalized.replace("-", "_")
+    if normalized in {"processed", "success", "succeeded", "completed"}:
+        return RefundRecord.Status.SUCCESS
+    if normalized in {"pending", "needs_attention", "needs_attension"}:
+        return RefundRecord.Status.PENDING
+    if normalized in {"processing", "in_progress"}:
+        return RefundRecord.Status.PROCESSING
+    if normalized in {"failed", "failure"}:
+        return RefundRecord.Status.FAILED
+    if normalized in {"reversed"}:
+        return RefundRecord.Status.REVERSED
+    return RefundRecord.Status.PROCESSING
+
+
+def find_refund_for_webhook(refund_data):
+    refund_reference = str(refund_data.get("refund_reference") or "").strip()
+    transaction_reference = str(refund_data.get("transaction_reference") or "").strip()
+    provider_reference = str(refund_data.get("id") or "").strip()
+
+    base_query = RefundRecord.objects.select_for_update().select_related("escrow").order_by("-created_at")
+
+    if refund_reference:
+        refund = base_query.filter(reference=refund_reference).first()
+        if refund:
+            return refund
+
+    if provider_reference:
+        refund = base_query.filter(provider_reference=provider_reference).first()
+        if refund:
+            return refund
+
+    if transaction_reference:
+        refund = base_query.filter(metadata__payment_reference=transaction_reference).first()
+        if refund:
+            return refund
+
+        # Fallback for databases where JSON key lookup may be limited.
+        for candidate in base_query[:200]:
+            if str((candidate.metadata or {}).get("payment_reference") or "").strip() == transaction_reference:
+                return candidate
+
+    return None
+
+
 def payout_error_response(message, errors, code=status.HTTP_400_BAD_REQUEST):
     return Response(
         build_response(False, message, data=None, errors=errors),
@@ -142,6 +222,52 @@ def mark_payout_failed(payout_id, error_message, extra_metadata=None):
         payout.metadata = metadata
         payout.save(update_fields=["status", "metadata", "updated_at"])
         return payout
+
+
+def payout_provider_error_response(exc, stage):
+    message = str(exc).strip() or "Paystack payout request failed."
+    normalized = message.lower()
+    status_code = getattr(exc, "status_code", None)
+
+    details = {
+        "stage": stage,
+        "status_code": status_code,
+        "payload": getattr(exc, "payload", None) or {},
+    }
+
+    account_related_markers = (
+        "cannot resolve account",
+        "invalid account",
+        "invalid bank",
+        "account number",
+        "bank code",
+        "bank account",
+        "nuban",
+    )
+    if any(marker in normalized for marker in account_related_markers) or status_code in {400, 422}:
+        return (
+            status.HTTP_400_BAD_REQUEST,
+            {
+                "payout_details": [
+                    "Unable to resolve payout account. Confirm bank code and account number.",
+                    message,
+                ]
+            },
+            details,
+        )
+
+    if "unable to reach paystack" in normalized or status_code in {502, 503, 504}:
+        return (
+            status.HTTP_502_BAD_GATEWAY,
+            {"provider": [message]},
+            details,
+        )
+
+    return (
+        status.HTTP_500_INTERNAL_SERVER_ERROR,
+        {"provider": [message]},
+        details,
+    )
 
 
 def process_verified_payment_reference(reference, actor=None, source="api_verify", webhook_payload=None):
@@ -624,6 +750,100 @@ def paystack_webhook_view(request):
             status=status.HTTP_200_OK,
         )
 
+    if isinstance(event_type, str) and event_type.startswith("refund."):
+        with transaction.atomic():
+            webhook_event = PaystackWebhookEvent.objects.select_for_update().filter(id=webhook_event.id).first()
+            refund_record = find_refund_for_webhook(data)
+
+            if not refund_record:
+                webhook_event.processed = True
+                webhook_event.processed_at = timezone.now()
+                webhook_event.save(update_fields=["processed", "processed_at"])
+                return Response(
+                    build_response(
+                        True,
+                        "Refund webhook received with no matching refund record.",
+                        data={
+                            "event": event_type,
+                            "transaction_reference": data.get("transaction_reference"),
+                            "refund_reference": data.get("refund_reference"),
+                            "provider_reference": str(data.get("id") or ""),
+                        },
+                        errors=None,
+                    ),
+                    status=status.HTTP_200_OK,
+                )
+
+            escrow = EscrowTransaction.objects.select_for_update().filter(id=refund_record.escrow_id).first()
+            if not escrow:
+                webhook_event.processed = True
+                webhook_event.processed_at = timezone.now()
+                webhook_event.save(update_fields=["processed", "processed_at"])
+                return Response(
+                    build_response(
+                        False,
+                        "Escrow not found.",
+                        data=None,
+                        errors={"escrow": ["Escrow does not exist for this refund record."]},
+                    ),
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+            mapped_status = map_refund_webhook_status(event_type=event_type, payload_status=data.get("status"))
+            previous_status = refund_record.status
+
+            metadata = refund_record.metadata or {}
+            metadata["last_refund_webhook"] = payload
+            refund_record.metadata = metadata
+
+            provider_reference = str(
+                data.get("id")
+                or data.get("refund_reference")
+                or data.get("reference")
+                or ""
+            ).strip()
+            if provider_reference:
+                refund_record.provider_reference = provider_reference
+
+            # Never downgrade a successful refund due to out-of-order webhook events.
+            if previous_status == RefundRecord.Status.SUCCESS and mapped_status != RefundRecord.Status.SUCCESS:
+                mapped_status = RefundRecord.Status.SUCCESS
+
+            refund_record.status = mapped_status
+            if mapped_status == RefundRecord.Status.SUCCESS:
+                refund_record.processed_at = timezone.now()
+                if escrow.status != EscrowTransaction.Status.REFUNDED:
+                    escrow.status = EscrowTransaction.Status.REFUNDED
+                    escrow.save(update_fields=["status", "updated_at"])
+            refund_record.save()
+
+            webhook_event.processed = True
+            webhook_event.processed_at = timezone.now()
+            webhook_event.save(update_fields=["processed", "processed_at"])
+
+        response_data = {
+            "event": event_type,
+            "escrow_id": escrow.id,
+            "escrow_status": escrow.status,
+            "refund": refund_record_payload(refund_record),
+        }
+
+        if mapped_status == RefundRecord.Status.SUCCESS:
+            return Response(
+                build_response(True, "Refund webhook processed successfully.", data=response_data, errors=None),
+                status=status.HTTP_200_OK,
+            )
+
+        return Response(
+            build_response(
+                True,
+                "Refund webhook processed; refund is not in success status yet.",
+                data=response_data,
+                errors=None,
+            ),
+            status=status.HTTP_200_OK,
+        )
+
     if event_type != "charge.success":
         webhook_event.processed = True
         webhook_event.processed_at = timezone.now()
@@ -696,10 +916,63 @@ def paystack_webhook_view(request):
     )
 
 
-@api_view(["POST"])
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def list_my_payouts_view(request):
+    """Authenticated endpoint for the current seller's payout records."""
+    payouts = (
+        PayoutRecord.objects.filter(escrow__seller=request.user)
+        .select_related("escrow", "escrow__buyer", "escrow__seller")
+        .order_by("-created_at")
+    )
+    data = [payout_record_payload(payout) for payout in payouts]
+    return Response(
+        build_response(True, "My payouts fetched successfully.", data=data, errors=None),
+        status=status.HTTP_200_OK,
+    )
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def my_payout_detail_view(request, payout_id):
+    """Authenticated endpoint for one seller-owned payout record."""
+    payout = (
+        PayoutRecord.objects.filter(id=payout_id, escrow__seller=request.user)
+        .select_related("escrow", "escrow__buyer", "escrow__seller")
+        .first()
+    )
+    if not payout:
+        return payout_error_response(
+            "Payout not found.",
+            {"payout": ["Payout record does not exist."]},
+            status.HTTP_404_NOT_FOUND,
+        )
+
+    payout_destination = SellerPayoutDetail.objects.filter(user=request.user).first()
+    data = {
+        **payout_record_payload(payout),
+        "escrow": payout_escrow_summary_payload(payout.escrow),
+        "destination": seller_payout_detail_payload(payout_destination) if payout_destination else None,
+    }
+    return Response(
+        build_response(True, "Payout detail fetched successfully.", data=data, errors=None),
+        status=status.HTTP_200_OK,
+    )
+
+
+@api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def upsert_seller_payout_detail_view(request):
-    """Create or replace the authenticated seller payout destination details."""
+    """Fetch or create/replace the authenticated seller payout destination details."""
+    if request.method == "GET":
+        detail = SellerPayoutDetail.objects.filter(user=request.user).first()
+        data = seller_payout_detail_payload(detail) if detail else {}
+        return Response(
+            build_response(True, "Payout details fetched successfully.", data=data, errors=None),
+            status=status.HTTP_200_OK,
+        )
+
+    # POST: create or replace payout details.
     bank_code = request.data.get("bank_code")
     account_number = request.data.get("account_number")
     account_name = request.data.get("account_name")
@@ -932,6 +1205,20 @@ def execute_payout_view(request, payout_id):
 
     if not recipient_code:
         try:
+            account_resolution = resolve_paystack_account(
+                account_number=account_number,
+                bank_code=bank_code,
+            )
+            resolved_data = account_resolution.get("data", {})
+            resolved_name = str(resolved_data.get("account_name") or "").strip()
+            if resolved_name:
+                recipient_name = resolved_name
+        except PaystackPayoutError as exc:
+            code, errors, details = payout_provider_error_response(exc, stage="account_resolve")
+            mark_payout_failed(payout_id, str(exc), extra_metadata=details)
+            return payout_error_response("Payout execution failed.", errors, code)
+
+        try:
             recipient_response = create_paystack_transfer_recipient(
                 name=recipient_name,
                 account_number=account_number,
@@ -939,11 +1226,9 @@ def execute_payout_view(request, payout_id):
                 currency=currency,
             )
         except PaystackPayoutError as exc:
-            code = status.HTTP_500_INTERNAL_SERVER_ERROR
-            if "Unable to reach Paystack." in str(exc):
-                code = status.HTTP_502_BAD_GATEWAY
-            mark_payout_failed(payout_id, str(exc))
-            return payout_error_response("Payout execution failed.", {"provider": [str(exc)]}, code)
+            code, errors, details = payout_provider_error_response(exc, stage="recipient_create")
+            mark_payout_failed(payout_id, str(exc), extra_metadata=details)
+            return payout_error_response("Payout execution failed.", errors, code)
 
         recipient_data = recipient_response.get("data", {})
         recipient_code = recipient_data.get("recipient_code")
@@ -973,11 +1258,9 @@ def execute_payout_view(request, payout_id):
             reason=f"Escrow payout #{escrow_id}",
         )
     except PaystackPayoutError as exc:
-        code = status.HTTP_500_INTERNAL_SERVER_ERROR
-        if "Unable to reach Paystack." in str(exc):
-            code = status.HTTP_502_BAD_GATEWAY
-        mark_payout_failed(payout_id, str(exc))
-        return payout_error_response("Payout execution failed.", {"provider": [str(exc)]}, code)
+        code, errors, details = payout_provider_error_response(exc, stage="transfer_initiate")
+        mark_payout_failed(payout_id, str(exc), extra_metadata=details)
+        return payout_error_response("Payout execution failed.", errors, code)
 
     transfer_data = transfer_response.get("data", {})
     transfer_status = map_transfer_status(transfer_data.get("status"))

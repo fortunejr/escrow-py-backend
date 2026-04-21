@@ -9,6 +9,7 @@ class CustomUserAdmin(UserAdmin):
     model = User
     ordering = ("id",)
     list_display = ("id", "email", "first_name", "last_name", "is_staff", "is_active")
+    list_filter = ("is_staff", "is_active", "is_superuser", "date_joined")
     search_fields = ("email", "first_name", "last_name")
 
     fieldsets = (

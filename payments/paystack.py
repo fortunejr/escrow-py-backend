@@ -1,7 +1,7 @@
 import json
 import hmac
 import hashlib
-from urllib import error, request
+from urllib import error, parse, request
 
 from django.conf import settings
 
@@ -20,9 +20,10 @@ class PaystackVerificationError(Exception):
 
 
 class PaystackPayoutError(Exception):
-    def __init__(self, message, payload=None):
+    def __init__(self, message, payload=None, status_code=None):
         super().__init__(message)
         self.payload = payload or {}
+        self.status_code = status_code
 
 
 def get_paystack_base_url():
@@ -188,9 +189,9 @@ def create_paystack_transfer_recipient(name, account_number, bank_code, currency
         except json.JSONDecodeError:
             body = {}
         message = body.get("message") or "Paystack recipient creation failed."
-        raise PaystackPayoutError(message, payload=body) from exc
+        raise PaystackPayoutError(message, payload=body, status_code=exc.code) from exc
     except error.URLError as exc:
-        raise PaystackPayoutError("Unable to reach Paystack.") from exc
+        raise PaystackPayoutError("Unable to reach Paystack.", status_code=502) from exc
 
     try:
         response_data = json.loads(raw_body) if raw_body else {}
@@ -233,9 +234,9 @@ def initiate_paystack_transfer(amount_kobo, recipient_code, reference, reason=""
         except json.JSONDecodeError:
             body = {}
         message = body.get("message") or "Paystack transfer initiation failed."
-        raise PaystackPayoutError(message, payload=body) from exc
+        raise PaystackPayoutError(message, payload=body, status_code=exc.code) from exc
     except error.URLError as exc:
-        raise PaystackPayoutError("Unable to reach Paystack.") from exc
+        raise PaystackPayoutError("Unable to reach Paystack.", status_code=502) from exc
 
     try:
         response_data = json.loads(raw_body) if raw_body else {}
@@ -276,9 +277,9 @@ def initiate_paystack_refund(transaction_reference, amount_kobo=None):
         except json.JSONDecodeError:
             body = {}
         message = body.get("message") or "Paystack refund initiation failed."
-        raise PaystackPayoutError(message, payload=body) from exc
+        raise PaystackPayoutError(message, payload=body, status_code=exc.code) from exc
     except error.URLError as exc:
-        raise PaystackPayoutError("Unable to reach Paystack.") from exc
+        raise PaystackPayoutError("Unable to reach Paystack.", status_code=502) from exc
 
     try:
         response_data = json.loads(raw_body) if raw_body else {}
@@ -287,6 +288,47 @@ def initiate_paystack_refund(transaction_reference, amount_kobo=None):
 
     if not response_data.get("status"):
         message = response_data.get("message") or "Paystack refund initiation failed."
+        raise PaystackPayoutError(message, payload=response_data)
+
+    return response_data
+
+
+def resolve_paystack_account(account_number, bank_code):
+    secret_key = settings.PAYSTACK_SECRET_KEY
+    if not secret_key:
+        raise PaystackPayoutError("Paystack secret key is not configured.")
+
+    query = parse.urlencode(
+        {
+            "account_number": account_number,
+            "bank_code": bank_code,
+        }
+    )
+    url = f"{get_paystack_base_url()}/bank/resolve?{query}"
+    headers = build_paystack_headers(secret_key)
+    req = request.Request(url=url, headers=headers, method="GET")
+
+    try:
+        with request.urlopen(req, timeout=20) as resp:
+            raw_body = resp.read().decode("utf-8")
+    except error.HTTPError as exc:
+        raw = exc.read().decode("utf-8") if exc else ""
+        try:
+            body = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            body = {}
+        message = body.get("message") or "Paystack account resolve failed."
+        raise PaystackPayoutError(message, payload=body, status_code=exc.code) from exc
+    except error.URLError as exc:
+        raise PaystackPayoutError("Unable to reach Paystack.", status_code=502) from exc
+
+    try:
+        response_data = json.loads(raw_body) if raw_body else {}
+    except json.JSONDecodeError as exc:
+        raise PaystackPayoutError("Invalid response from Paystack.") from exc
+
+    if not response_data.get("status"):
+        message = response_data.get("message") or "Paystack account resolve failed."
         raise PaystackPayoutError(message, payload=response_data)
 
     return response_data
