@@ -411,7 +411,7 @@ def release_escrow_view(request, escrow_id):
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def refund_escrow_view(request, escrow_id):
-    """Trigger refund flow for funded escrow after strict ownership/state checks."""
+    """Admin-only refund execution flow for funded escrow."""
     reason = request.data.get("reason", "")
     if reason is not None and not isinstance(reason, str):
         return Response(
@@ -426,6 +426,17 @@ def refund_escrow_view(request, escrow_id):
 
     reason = (reason or "").strip()
 
+    if not request.user.is_staff:
+        return Response(
+            build_response(
+                False,
+                "Permission denied.",
+                data=None,
+                errors={"permission": ["Buyers cannot directly execute refunds. Open a dispute for admin review."]},
+            ),
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
     with transaction.atomic():
         escrow = (
             EscrowTransaction.objects.select_for_update()
@@ -437,17 +448,6 @@ def refund_escrow_view(request, escrow_id):
             return Response(
                 build_response(False, "Escrow not found.", data=None, errors={"escrow": ["Escrow does not exist."]}),
                 status=status.HTTP_404_NOT_FOUND,
-            )
-
-        if escrow.buyer_id != request.user.id and not request.user.is_staff:
-            return Response(
-                build_response(
-                    False,
-                    "Permission denied.",
-                    data=None,
-                    errors={"permission": ["Only the escrow buyer or admin can trigger refund at this stage."]},
-                ),
-                status=status.HTTP_403_FORBIDDEN,
             )
 
         if escrow.status == EscrowTransaction.Status.DISPUTED:

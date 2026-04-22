@@ -275,6 +275,13 @@ class EscrowRefundTests(APITestCase):
             first_name="Refund",
             last_name="Other",
         )
+        self.admin_user = User.objects.create_user(
+            email="refund_admin@example.com",
+            password="StrongPass123!",
+            first_name="Refund",
+            last_name="Admin",
+            is_staff=True,
+        )
         self.listing = Listing.objects.create(
             seller=self.seller,
             title="Refund Listing",
@@ -351,7 +358,7 @@ class EscrowRefundTests(APITestCase):
             },
         }
 
-        self.authenticate(self.buyer)
+        self.authenticate(self.admin_user)
         response = self.client.post(reverse("refund-escrow", kwargs={"escrow_id": self.funded_escrow.id}), {}, format="json")
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
@@ -362,7 +369,7 @@ class EscrowRefundTests(APITestCase):
         self.assertEqual(RefundRecord.objects.filter(escrow=self.funded_escrow).count(), 1)
         refund = RefundRecord.objects.get(escrow=self.funded_escrow)
         self.assertEqual(refund.status, RefundRecord.Status.SUCCESS)
-        self.assertEqual(refund.initiated_by_id, self.buyer.id)
+        self.assertEqual(refund.initiated_by_id, self.admin_user.id)
         self.assertTrue(
             AuditLog.objects.filter(
                 action=AuditLog.Action.REFUND_TRIGGERED,
@@ -373,7 +380,7 @@ class EscrowRefundTests(APITestCase):
 
     @patch("escrow.views.execute_paystack_refund_for_payment")
     def test_refund_blocked_after_release(self, mock_execute_refund):
-        self.authenticate(self.buyer)
+        self.authenticate(self.admin_user)
         response = self.client.post(reverse("refund-escrow", kwargs={"escrow_id": self.released_escrow.id}), {}, format="json")
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
@@ -393,7 +400,7 @@ class EscrowRefundTests(APITestCase):
             metadata={"payment_reference": "pay_ref_funded_001"},
         )
 
-        self.authenticate(self.buyer)
+        self.authenticate(self.admin_user)
         response = self.client.post(reverse("refund-escrow", kwargs={"escrow_id": self.funded_escrow.id}), {}, format="json")
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
@@ -402,8 +409,8 @@ class EscrowRefundTests(APITestCase):
         mock_execute_refund.assert_not_called()
 
     @patch("escrow.views.execute_paystack_refund_for_payment")
-    def test_unauthorized_refund_blocked(self, mock_execute_refund):
-        self.authenticate(self.other_user)
+    def test_buyer_direct_refund_blocked(self, mock_execute_refund):
+        self.authenticate(self.buyer)
         response = self.client.post(reverse("refund-escrow", kwargs={"escrow_id": self.funded_escrow.id}), {}, format="json")
 
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
@@ -413,7 +420,7 @@ class EscrowRefundTests(APITestCase):
 
     @patch("escrow.views.execute_paystack_refund_for_payment")
     def test_invalid_state_refund_blocked(self, mock_execute_refund):
-        self.authenticate(self.buyer)
+        self.authenticate(self.admin_user)
         response = self.client.post(reverse("refund-escrow", kwargs={"escrow_id": self.pending_escrow.id}), {}, format="json")
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
