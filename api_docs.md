@@ -418,6 +418,7 @@ Initialize Paystack payment for an escrow.
 Auth: Required (buyer only)
 
 Request:
+send `Idempotency-Key` in header; must be unique else returns same response
 ```json
 {
   "escrow_id": 21

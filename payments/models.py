@@ -191,3 +191,16 @@ class PaystackWebhookEvent(models.Model):
 
     def __str__(self):
         return f"Webhook {self.event} ({self.reference or 'no-ref'})"
+
+class IdempotencyKey(models.Model):
+    key = models.CharField(max_length=255, unique=True)
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    endpoint = models.CharField(max_length=255)
+
+    response_data = models.JSONField(null=True, blank=True)
+    status_code = models.IntegerField(null=True, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return self.key

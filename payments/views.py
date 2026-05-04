@@ -16,7 +16,7 @@ from core.audit import log_audit_event
 from core.models import AuditLog
 from escrow.models import EscrowTransaction
 
-from .models import PaymentRecord, PaystackWebhookEvent, PayoutRecord, RefundRecord, SellerPayoutDetail
+from .models import PaymentRecord, PaystackWebhookEvent, PayoutRecord, RefundRecord, SellerPayoutDetail, IdempotencyKey
 from .paystack import (
     PaystackInitializationError,
     PaystackPayoutError,
@@ -50,8 +50,8 @@ def payment_record_payload(record):
         "status": record.status,
         "authorization_url": record.authorization_url,
         "gateway_metadata": record.gateway_metadata,
-        "created_at": record.created_at,
-        "updated_at": record.updated_at,
+        "created_at": record.created_at.isoformat(),
+        "updated_at": record.updated_at.isoformat(),
     }
 
 
@@ -415,6 +415,29 @@ def process_verified_payment_reference(reference, actor=None, source="api_verify
 def initialize_escrow_payment_view(request):
     """Initialize Paystack checkout for a buyer-owned escrow in a payable state."""
     escrow_id = request.data.get("escrow_id")
+    idempotency_key = request.headers.get("Idempotency-Key")
+    print('idempotency_key:', idempotency_key)
+
+    if not idempotency_key:
+        return Response(
+            build_response(
+                False,
+                "Idempotency-Key header is required.",
+                data=None,
+                errors={"idempotency_key": ["Missing Idempotency-Key header."]},
+            ),
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    existing = IdempotencyKey.objects.filter(
+        key=idempotency_key,
+        user=request.user,
+        endpoint="initialize_payment"
+    ).first()
+
+    if existing and existing.response_data:
+        print("Existing idempotent response found for key:", idempotency_key)
+        return Response(existing.response_data, status=existing.status_code)
 
     if escrow_id is None:
         return Response(
@@ -469,12 +492,27 @@ def initialize_escrow_payment_view(request):
             ),
             status=status.HTTP_400_BAD_REQUEST,
         )
+    
+    
 
     escrow_amount = Decimal(escrow.amount)
     reference = generate_payment_reference(escrow.id)
     amount_kobo = int((escrow_amount * Decimal("100")).quantize(Decimal("1")))
     currency = "NGN"
     callback_url = str(getattr(settings, "PAYSTACK_CALLBACK_URL", "") or "").strip() or None
+
+    with transaction.atomic():
+        idempotency_obj, created = IdempotencyKey.objects.get_or_create(
+            key=idempotency_key,
+            user=request.user,
+            endpoint="initialize_payment",
+        )
+
+        if not created and idempotency_obj.response_data:
+            return Response(
+                idempotency_obj.response_data,
+                status=idempotency_obj.status_code,
+            )
 
     try:
         paystack_response = initialize_paystack_transaction(
@@ -590,10 +628,17 @@ def initialize_escrow_payment_view(request):
             "reference": paystack_data.get("reference") or reference,
         },
     }
-    return Response(
-        build_response(True, "Payment initialized successfully.", data=data, errors=None),
-        status=status.HTTP_200_OK,
-    )
+    response_payload = build_response(
+    True,
+    "Payment initialized successfully.",
+    data=data,
+    errors=None,
+)
+    idempotency_obj.response_data = response_payload
+    idempotency_obj.status_code = status.HTTP_200_OK
+    idempotency_obj.save(update_fields=["response_data", "status_code"])
+
+    return Response(response_payload, status=status.HTTP_200_OK)
 
 
 @api_view(["POST"])
